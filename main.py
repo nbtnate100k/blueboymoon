@@ -235,6 +235,18 @@ CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=False)
 def health_check():
     return jsonify({"status": "ok", "server": "PLUXO API"})
 
+@app.route('/api/products', methods=['GET', 'OPTIONS'])
+def get_products():
+    """Serve shop products for the website"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        shop_products = load_json(SHOP_PRODUCTS_FILE, [])
+        return jsonify(shop_products)
+    except Exception as e:
+        logger.error(f"Products API error: {e}")
+        return jsonify([]), 200  # Return empty array on error
+
 @app.route('/api/register', methods=['POST', 'OPTIONS'])
 def webhook_register():
     if request.method == 'OPTIONS':
@@ -595,25 +607,32 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add stock with price and BIN, generate key: /stock [price] [BIN]"""
+    """Add stock with price and BIN, optional key: /stock [price] [BIN] [key]"""
     if len(context.args) < 2:
         await update.message.reply_text("""📦 **Stock Command Usage:**
 
 ```
-/stock [price] [BIN]
+/stock [price] [BIN] [key]
 ```
 
-**Example:**
+**Examples:**
 ```
 /stock 15 5355
+/stock 15 5355 IEVJ073E3TFBZVJC
+/stock $15 5355 IEVJ073E3TFBZVJC
 /stock 12.50 4145
 ```
+
+**Options:**
+- Price: Number (with or without $)
+- BIN: 4-6 digits
+- Key: Optional, 16 characters (auto-generated if not provided)
 
 This will create a product with:
 - Price: $15.00
 - BIN: 5355
 - Display: `5355********** $15.0`
-- Unique key generated automatically""", parse_mode='Markdown')
+- Key: Provided or auto-generated""", parse_mode='Markdown')
         return
     
     # Parse price
@@ -641,6 +660,29 @@ This will create a product with:
     # Pad BIN to 6 digits for consistency (first 6 digits)
     bin_str = bin_input[:6].ljust(6, '0') if len(bin_input) < 6 else bin_input[:6]
     
+    # Parse optional key (handle "Key: XXX" format or just the key)
+    provided_key = None
+    if len(context.args) >= 3:
+        # Join all remaining args in case key has spaces or "Key:" prefix
+        remaining_args = ' '.join(context.args[2:]).strip()
+        logger.info(f"Raw key input: {remaining_args}")
+        
+        # Handle "Key: IEVJ073E3TFBZVJC" format
+        if remaining_args.lower().startswith('key:'):
+            remaining_args = remaining_args[4:].strip()
+        
+        # Remove any non-alphanumeric characters and uppercase
+        cleaned_key = ''.join(c for c in remaining_args if c.isalnum()).upper()
+        logger.info(f"Cleaned key: {cleaned_key}")
+        
+        # Validate key format (alphanumeric, at least 8 chars)
+        if cleaned_key and len(cleaned_key) >= 8:
+            provided_key = cleaned_key
+            logger.info(f"Using provided key: {provided_key}")
+        else:
+            await update.message.reply_text(f"❌ Invalid key format! Key must be alphanumeric and at least 8 characters. Got: `{cleaned_key}` (length: {len(cleaned_key)})", parse_mode='Markdown')
+            return
+    
     # Load existing shop products
     shop_products = load_json(SHOP_PRODUCTS_FILE, [])
     if not isinstance(shop_products, list):
@@ -649,11 +691,19 @@ This will create a product with:
     # Get next ID
     next_id = max([p.get('id', 0) for p in shop_products], default=0) + 1
     
-    # Generate unique key
-    key = generate_key()
+    # Use provided key or generate unique key
     existing_keys = {p.get('key', '') for p in shop_products}
-    while key in existing_keys:
+    if provided_key:
+        # Check if key already exists
+        if provided_key in existing_keys:
+            await update.message.reply_text(f"❌ Key `{provided_key}` already exists! Please use a different key.", parse_mode='Markdown')
+            return
+        key = provided_key
+    else:
+        # Generate unique key
         key = generate_key()
+        while key in existing_keys:
+            key = generate_key()
     
     # Determine brand from BIN
     brand = get_brand_from_bin(bin_str)
@@ -693,6 +743,7 @@ This will create a product with:
     
     # Build response
     masked_display = bin_str + "**********"
+    key_source = "Provided" if provided_key else "Auto-generated"
     response = f"""✅ **Stock Added Successfully!**
 
 📦 **Product Details:**
@@ -701,7 +752,7 @@ This will create a product with:
 • Price: **${price:.2f}**
 • Brand: {brand}
 
-🔑 **Key:** `{key}`
+🔑 **Key:** `{key}` ({key_source})
 
 📊 Total stock: {len(shop_products)} products"""
     
