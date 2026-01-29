@@ -8,6 +8,9 @@ import os
 import logging
 import threading
 import asyncio
+import re
+import random
+import string
 from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, request, jsonify
@@ -28,6 +31,7 @@ ADMINS_FILE = os.path.join(DATA_DIR, "admins.json")
 BALANCES_FILE = os.path.join(DATA_DIR, "balances.json")
 PURCHASES_FILE = os.path.join(DATA_DIR, "purchases.json")
 LOGS_FILE = os.path.join(DATA_DIR, "action_logs.json")
+SHOP_PRODUCTS_FILE = "shop_products.json"
 
 SYSTEM_LOCKED = False
 
@@ -99,6 +103,126 @@ def log_action(admin_id, admin_name, action, details=""):
     })
     logs["logs"] = logs["logs"][-1000:]
     save_json(LOGS_FILE, logs)
+
+def generate_key(length=16):
+    """Generate a random alphanumeric key"""
+    chars = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+def parse_bulk_cards(text: str):
+    """Parse bulk pipe-delimited cards (card|mm|yyyy|cvv)"""
+    cards = []
+    lines = text.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Match: 5355851164846467|02|2026|358
+        match = re.match(r'^(\d{15,16})\|(\d{1,2})\|(\d{4})\|(\d{3,4})$', line)
+        if match:
+            card_number = match.group(1)
+            exp_month = match.group(2).zfill(2)
+            exp_year = match.group(3)
+            cvv = match.group(4)
+            
+            if len(card_number) == 15:
+                card_number = '0' + card_number
+            
+            cards.append({
+                'card_number': card_number,
+                'exp_month': exp_month,
+                'exp_year': exp_year,
+                'cvv': cvv,
+                'full_text': f"{card_number}|{exp_month}|{exp_year}|{cvv}",
+                'name': '',
+                'address': '',
+                'city_state_zip': '',
+                'country': ''
+            })
+    
+    return cards
+
+def parse_multiline_cards(text: str):
+    """Parse multi-line cards with address info (card exp cvv + 4 lines of info)"""
+    cards = []
+    lines = text.strip().split('\n')
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+        
+        # Match: 4145670692391812 01/29 651
+        match = re.match(r'^(\d{15,16})\s+(\d{2})/(\d{2})\s+(\d{3,4})$', line)
+        if match:
+            card_number = match.group(1)
+            exp_month = match.group(2)
+            exp_year_short = match.group(3)
+            cvv = match.group(4)
+            
+            # Convert 2-digit year to 4-digit
+            exp_year = '20' + exp_year_short
+            
+            if len(card_number) == 15:
+                card_number = '0' + card_number
+            
+            # Get next 4 lines for address info
+            name = lines[i + 1].strip() if i + 1 < len(lines) else ''
+            address = lines[i + 2].strip() if i + 2 < len(lines) else ''
+            city_state_zip = lines[i + 3].strip() if i + 3 < len(lines) else ''
+            country = lines[i + 4].strip() if i + 4 < len(lines) else ''
+            
+            full_text = f"{card_number} {exp_month}/{exp_year_short} {cvv}\n{name}\n{address}\n{city_state_zip}\n{country}"
+            
+            cards.append({
+                'card_number': card_number,
+                'exp_month': exp_month,
+                'exp_year': exp_year,
+                'cvv': cvv,
+                'full_text': full_text,
+                'name': name,
+                'address': address,
+                'city_state_zip': city_state_zip,
+                'country': country
+            })
+            
+            i += 5  # Skip to next card block
+            continue
+        
+        i += 1
+    
+    return cards
+
+def parse_all_formats(text: str):
+    """Try both card formats and return parsed cards"""
+    # Try pipe format first
+    cards = parse_bulk_cards(text)
+    if cards:
+        return cards
+    
+    # Try multi-line format
+    cards = parse_multiline_cards(text)
+    if cards:
+        return cards
+    
+    return []
+
+def get_brand_from_bin(bin_str):
+    """Determine card brand from BIN"""
+    if not bin_str or len(bin_str) < 6:
+        return "VISA"
+    first_digit = bin_str[0]
+    if first_digit == "4":
+        return "VISA"
+    elif first_digit == "5":
+        return "MASTERCARD"
+    elif first_digit == "3":
+        return "AMEX"
+    return "VISA"
 
 ADMIN_IDS = load_admins()
 
@@ -212,6 +336,57 @@ def update_user_balance():
         logger.error(f"Balance update error: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/purchase/notify', methods=['POST', 'OPTIONS'])
+def notify_purchase():
+    """Notify admins about a purchase made on the website"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        secret = request.headers.get('X-Webhook-Secret', '')
+        if secret != WEBHOOK_SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
+        
+        data = request.json
+        username = data.get('username', '').lower().strip()
+        item_count = data.get('item_count', 1)
+        total_amount = float(data.get('total_amount', 0))
+        
+        if not username:
+            return jsonify({"error": "Username required"}), 400
+        
+        # Send notification to all admins via Telegram bot (run in background)
+        threading.Thread(target=lambda: asyncio.run(notify_admins_purchase(username, item_count, total_amount)), daemon=True).start()
+        
+        return jsonify({"success": True, "message": "Notification sent"})
+    except Exception as e:
+        logger.error(f"Purchase notification error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+async def notify_admins_purchase(username, item_count, total_amount):
+    """Send purchase notification to all admins"""
+    try:
+        bot = Bot(token=BOT_TOKEN)
+        purchase_time = datetime.now(timezone.utc)
+        date_str = purchase_time.strftime('%Y-%m-%d')
+        time_str = purchase_time.strftime('%H:%M:%S UTC')
+        
+        message = f"""🛒 **Purchase Made**
+━━━━━━━━━━━━━━━━━━
+👤 Username: `{username}`
+📦 Items: {item_count}
+💵 Total: **${total_amount:.2f}**
+📅 Date: {date_str}
+🕐 Time: {time_str}
+━━━━━━━━━━━━━━━━━━"""
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(chat_id=admin_id, text=message, parse_mode='Markdown')
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error sending purchase notification: {e}")
+
 # ==================== TELEGRAM BOT DECORATORS ====================
 def admin_only(func):
     @wraps(func)
@@ -248,6 +423,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /addbalance <user> <amt> - Add balance
 /removebalance <user> <amt> - Remove balance
 /users - List all users
+
+📦 **Stock:**
+/stock <price> <cards> - Add cards to shop
 
 👥 **Admin (Owner only):**
 /addadmin <id> - Add admin
@@ -415,6 +593,123 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"• `{admin_id}` - {role}\n"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
+@admin_only
+async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add stock with price and BIN, generate key: /stock [price] [BIN]"""
+    if len(context.args) < 2:
+        await update.message.reply_text("""📦 **Stock Command Usage:**
+
+```
+/stock [price] [BIN]
+```
+
+**Example:**
+```
+/stock 15 5355
+/stock 12.50 4145
+```
+
+This will create a product with:
+- Price: $15.00
+- BIN: 5355
+- Display: `5355********** $15.0`
+- Unique key generated automatically""", parse_mode='Markdown')
+        return
+    
+    # Parse price
+    try:
+        price_str = context.args[0].replace('$', '').replace(',', '')
+        price = float(price_str)
+        if price <= 0 or price > 10000:
+            await update.message.reply_text("❌ Invalid price! Price must be between $0.01 and $10,000", parse_mode='Markdown')
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Invalid price format! Use a number like: 15 or 12.50", parse_mode='Markdown')
+        return
+    
+    # Parse BIN (first 4-6 digits)
+    bin_input = context.args[1].strip()
+    if not bin_input.isdigit():
+        await update.message.reply_text("❌ Invalid BIN! BIN must be digits only (4-6 digits)", parse_mode='Markdown')
+        return
+    
+    # Ensure BIN is 4-6 digits
+    if len(bin_input) < 4 or len(bin_input) > 6:
+        await update.message.reply_text("❌ BIN must be 4-6 digits!", parse_mode='Markdown')
+        return
+    
+    # Pad BIN to 6 digits for consistency (first 6 digits)
+    bin_str = bin_input[:6].ljust(6, '0') if len(bin_input) < 6 else bin_input[:6]
+    
+    # Load existing shop products
+    shop_products = load_json(SHOP_PRODUCTS_FILE, [])
+    if not isinstance(shop_products, list):
+        shop_products = []
+    
+    # Get next ID
+    next_id = max([p.get('id', 0) for p in shop_products], default=0) + 1
+    
+    # Generate unique key
+    key = generate_key()
+    existing_keys = {p.get('key', '') for p in shop_products}
+    while key in existing_keys:
+        key = generate_key()
+    
+    # Determine brand from BIN
+    brand = get_brand_from_bin(bin_str)
+    
+    # Create product entry matching shop_products.json format
+    product_entry = {
+        "id": next_id,
+        "bin": bin_str,
+        "brand": brand,
+        "type": "CREDIT",
+        "country": {
+            "flag": "🇺🇸",
+            "flagClass": "fi-us",
+            "code": "US",
+            "name": "USA"
+        },
+        "hasName": True,
+        "hasAddress": True,
+        "hasZip": True,
+        "hasPhone": False,
+        "hasMail": False,
+        "hasSSN": False,
+        "hasDOB": False,
+        "bank": "BANK",
+        "base": "2026_US_Base",
+        "refundable": True,
+        "price": str(price),
+        "key": key,
+        "seller_id": str(update.effective_user.id),
+        "full_info": ""
+    }
+    
+    shop_products.append(product_entry)
+    
+    # Save shop products
+    save_json(SHOP_PRODUCTS_FILE, shop_products)
+    
+    # Build response
+    masked_display = bin_str + "**********"
+    response = f"""✅ **Stock Added Successfully!**
+
+📦 **Product Details:**
+• BIN: `{bin_str}`
+• Display: `{masked_display}`
+• Price: **${price:.2f}**
+• Brand: {brand}
+
+🔑 **Key:** `{key}`
+
+📊 Total stock: {len(shop_products)} products"""
+    
+    user = update.effective_user
+    log_action(user.id, user.first_name, "ADD_STOCK", f"Added BIN {bin_str} at ${price:.2f} with key {key}")
+    
+    await update.message.reply_text(response, parse_mode='Markdown')
+
 # ==================== BOT THREAD ====================
 def run_bot():
     """Run the Telegram bot in a separate thread"""
@@ -432,6 +727,7 @@ def run_bot():
         application.add_handler(CommandHandler("addadmin", add_admin))
         application.add_handler(CommandHandler("removeadmin", remove_admin))
         application.add_handler(CommandHandler("admins", list_admins))
+        application.add_handler(CommandHandler("stock", add_stock))
         
         logger.info("Bot started with polling...")
         await application.initialize()
